@@ -1,6 +1,8 @@
 import io
+import re
 import time
 import zipfile
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -82,10 +84,38 @@ if uploaded is not None:
 
         total = len(df)
 
+        hyperlink_pattern = re.compile(
+            r"=HYPERLINK\(\"([^\"]+)\"(?:,\"[^\"]*\")?\)", re.IGNORECASE
+        )
+
+        def normalize_url(raw_value: str) -> str:
+            """Handle Excel-style HYPERLINK formulas and bare domains."""
+
+            if not isinstance(raw_value, str):
+                raw_value = "" if pd.isna(raw_value) else str(raw_value)
+
+            cleaned = raw_value.strip().strip("'\"")
+
+            match = hyperlink_pattern.fullmatch(cleaned)
+            if match:
+                cleaned = match.group(1).strip()
+
+            if cleaned.startswith("www."):
+                cleaned = f"https://{cleaned}"
+
+            return cleaned
+
+        def is_valid_url(url: str) -> bool:
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                return False
+            return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
         for idx, row in df.iterrows():
             progress.progress((idx + 1) / total)
             vin = str(row[vin_col]) if not pd.isna(row[vin_col]) else f"row_{idx}"
-            ebrochure_url = str(row[ebrochure_col]).strip()
+            ebrochure_url = normalize_url(row[ebrochure_col])
 
             status_text.text(f"[{idx+1}/{total}] Processing VIN {vin}…")
 
@@ -94,7 +124,7 @@ if uploaded is not None:
             file_info = None
 
             # Basic sanity check
-            if not ebrochure_url.startswith("http"):
+            if not is_valid_url(ebrochure_url):
                 error = "Invalid eBrochure URL"
                 results.append(
                     {
