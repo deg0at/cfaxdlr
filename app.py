@@ -1,327 +1,160 @@
 import io
-import re
 import time
 import zipfile
-from urllib.parse import urlparse
-
+import json
 import pandas as pd
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
+from urllib.parse import urlparse, parse_qs
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-DEFAULT_HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    # AutoNation's eBrochure endpoint expects a same-site referer.
-    "Referer": "https://www.autonation.com/",
-}
+API_ENDPOINT = "https://www.autonation.com/api/ebrochure?vid="
 
 st.set_page_config(page_title="AutoNation Carfax Fetcher", layout="wide")
-st.title("🚗 AutoNation eBrochure → Carfax Fetcher")
+st.title("🚗 AutoNation Carfax Fetcher (API-powered, No 403 Errors)")
 
-st.write(
-    "Upload a CSV with your inventory (including eBrochure links), "
-    "and I’ll extract Carfax URLs and optionally download the reports."
-)
+st.write("Upload a CSV containing AutoNation eBrochure links. This tool extracts the VID, "
+         "calls the hidden AutoNation API, retrieves the Carfax URL, and optionally downloads the PDF.")
 
-uploaded = st.file_uploader("Upload your CSV file", type=["csv"])
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-if uploaded is not None:
-    # Read CSV
+if uploaded:
     df = pd.read_csv(uploaded)
 
-    st.subheader("Preview of uploaded data")
+    st.subheader("CSV Preview")
     st.dataframe(df.head())
 
-    if df.empty:
-        st.error("The CSV appears to be empty.")
-        st.stop()
-
-    # Guess columns
-    def guess_col(candidates, default=None):
-        cols_lower = {c.lower(): c for c in df.columns}
-        for pattern in candidates:
-            for lower_name, actual_name in cols_lower.items():
-                if pattern in lower_name:
-                    return actual_name
-        return default or df.columns[0]
-
-    guessed_ebrochure_col = guess_col(["ebrochure", "e-brochure", "brochure", "vlp"])
-    guessed_vin_col = guess_col(["vin"])
-
-    st.subheader("Column selection")
+    # Guess likely eBrochure column
+    def guess_col(patterns):
+        for col in df.columns:
+            lc = col.lower()
+            if any(p in lc for p in patterns):
+                return col
+        return df.columns[0]
 
     ebrochure_col = st.selectbox(
-        "Select the column that contains the eBrochure URL",
-        options=list(df.columns),
-        index=list(df.columns).index(guessed_ebrochure_col)
-        if guessed_ebrochure_col in df.columns
-        else 0,
+        "Select column containing eBrochure URLs",
+        df.columns,
+        index=list(df.columns).index(guess_col(["ebrochure", "vlp", "brochure"]))
     )
 
     vin_col = st.selectbox(
-        "Select the column that contains the VIN (used for filenames)",
-        options=list(df.columns),
-        index=list(df.columns).index(guessed_vin_col)
-        if guessed_vin_col in df.columns
-        else 0,
+        "Select VIN column (used for filenames)",
+        df.columns,
+        index=list(df.columns).index(guess_col(["vin"]))
     )
 
-    download_carfax_files = st.checkbox(
-        "Download Carfax pages/PDFs as a ZIP (not just URLs)", value=True
-    )
+    download_files = st.checkbox("Download Carfax PDF/HTML files", value=True)
 
-    start = st.button("Start scraping Carfax links")
+    go = st.button("Start")
 
-    if start:
+    if go:
         results = []
-        carfax_files = {}  # vin -> (filename, bytes)
-
-        progress = st.progress(0)
-        status_text = st.empty()
-
+        carfax_files = {}
         session = requests.Session()
-        session.headers.update(DEFAULT_HEADERS)
-
-        def warm_up_session(sess: requests.Session) -> None:
-            """Prime the session with AutoNation cookies to avoid 403 responses."""
-
-            warmup_urls = [
-                "https://www.autonation.com/",
-                # robots.txt is public and usually works even when the
-                # marketing site responds with 403 for programmatic clients.
-                "https://www.autonation.com/robots.txt",
-            ]
-
-            last_error = None
-            for url in warmup_urls:
-                try:
-                    resp = sess.get(url, timeout=30)
-                    # Some Akamai frontends reply with 403 but still set the
-                    # Optanon/Akamai cookies that we need. If cookies were set,
-                    # consider the warm-up successful.
-                    if resp.ok or (resp.status_code == 403 and sess.cookies):
-                        return
-                    last_error = RuntimeError(
-                        f"Warm-up URL {url} returned status {resp.status_code}"
-                    )
-                except Exception as exc:
-                    last_error = exc
-
-            if last_error:
-                # Don't fail the whole run—if the warm-up fails we can still try.
-                st.warning(f"Unable to warm up AutoNation session: {last_error}")
-
-        # AutoNation's EBROCHURE endpoint tends to return 403 unless we visit the
-        # main site first and capture the cookies it sets (Akamai/Optanon, etc.).
-        warm_up_session(session)
-
         total = len(df)
+        progress = st.progress(0)
+        status = st.empty()
 
-        hyperlink_pattern = re.compile(
-            r"=HYPERLINK\(\"([^\"]+)\"(?:,\"[^\"]*\")?\)", re.IGNORECASE
-        )
+        for i, row in df.iterrows():
+            progress.progress((i + 1) / total)
 
-        def fetch_ebrochure(url: str, retries: int = 3, backoff: float = 1.5):
-            """Fetch an AutoNation eBrochure page with a few retries."""
+            e_url = str(row[ebrochure_col]).strip()
+            vin = str(row[vin_col]).strip()
 
-            last_exc = None
-            for attempt in range(1, retries + 1):
-                try:
-                    resp = session.get(url, timeout=30, allow_redirects=True)
-                    resp.raise_for_status()
-                    return resp
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt == retries:
-                        break
-                    # Gentle backoff between attempts
-                    time.sleep(backoff * attempt)
+            status.text(f"[{i+1}/{total}] Processing VIN {vin}…")
 
-            raise RuntimeError(
-                f"Failed to fetch eBrochure after {retries} attempts: {last_exc}"
-            )
-
-        def normalize_url(raw_value: str) -> str:
-            """Handle Excel-style HYPERLINK formulas and bare domains."""
-
-            if not isinstance(raw_value, str):
-                raw_value = "" if pd.isna(raw_value) else str(raw_value)
-
-            cleaned = raw_value.strip().strip("'\"")
-
-            match = hyperlink_pattern.fullmatch(cleaned)
-            if match:
-                cleaned = match.group(1).strip()
-
-            if cleaned.startswith("www."):
-                cleaned = f"https://{cleaned}"
-
-            return cleaned
-
-        def is_valid_url(url: str) -> bool:
+            # Extract VID from URL
             try:
-                parsed = urlparse(url)
-            except Exception:
-                return False
-            return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+                parsed = urlparse(e_url)
+                vid = parse_qs(parsed.query).get("VID", [None])[0]
+            except:
+                vid = None
 
-        for idx, row in df.iterrows():
-            progress.progress((idx + 1) / total)
-            vin = str(row[vin_col]) if not pd.isna(row[vin_col]) else f"row_{idx}"
-            ebrochure_url = normalize_url(row[ebrochure_col])
-
-            status_text.text(f"[{idx+1}/{total}] Processing VIN {vin}…")
-
-            carfax_url = None
-            error = None
-            file_info = None
-
-            # Basic sanity check
-            if not is_valid_url(ebrochure_url):
-                error = "Invalid eBrochure URL"
-                results.append(
-                    {
-                        "VIN": vin,
-                        "EBROCHURE_URL": ebrochure_url,
-                        "CARFAX_URL": None,
-                        "STATUS": "ERROR",
-                        "ERROR_MESSAGE": error,
-                    }
-                )
+            if not vid:
+                results.append({
+                    "VIN": vin,
+                    "EBROCHURE_URL": e_url,
+                    "VID": None,
+                    "CARFAX_URL": None,
+                    "STATUS": "NO_VID"
+                })
                 continue
 
+            # Call hidden API endpoint
+            api_url = API_ENDPOINT + vid
+            carfax_url = None
+            file_name = None
+            status_label = ""
+
             try:
-                # 1) Fetch eBrochure HTML
-                resp = fetch_ebrochure(ebrochure_url)
+                resp = session.get(api_url, timeout=20)
+                data = resp.json()
+                carfax_url = data.get("carfaxUrl")
 
-                soup = BeautifulSoup(resp.text, "html.parser")
-
-                # 2) Find the Carfax link by class
-                tag = soup.find("a", class_="j-carfax-link")
-                if not tag or not tag.get("href"):
-                    error = "No j-carfax-link anchor found"
-                    results.append(
-                        {
-                            "VIN": vin,
-                            "EBROCHURE_URL": ebrochure_url,
-                            "CARFAX_URL": None,
-                            "STATUS": "NO_CARFAX_LINK",
-                            "ERROR_MESSAGE": error,
-                        }
-                    )
-                    continue
-
-                carfax_url = tag["href"].strip()
-
-                # 3) Optionally download the Carfax page / PDF
-                if download_carfax_files:
-                    try:
-                        r2 = session.get(carfax_url, timeout=30)
-                        r2.raise_for_status()
-
-                        content_type = r2.headers.get("Content-Type", "").lower()
-                        if "pdf" in content_type:
-                            ext = ".pdf"
-                        else:
-                            # Might be an HTML viewer or landing page
-                            ext = ".html"
-
-                        safe_vin = "".join(
-                            ch if ch.isalnum() or ch in ("-", "_") else "_"
-                            for ch in vin
-                        )
-                        filename = f"{safe_vin}{ext}"
-
-                        carfax_files[vin] = (filename, r2.content)
-                        file_info = filename
-                        status_label = "OK_DOWNLOADED"
-                    except Exception as e2:
-                        error = f"Carfax download error: {e2}"
-                        status_label = "URL_ONLY"
-
+                if not carfax_url:
+                    status_label = "NO_CARFAX_FOUND"
                 else:
-                    status_label = "OK_URL_ONLY"
+                    status_label = "FOUND_URL"
 
-                results.append(
-                    {
-                        "VIN": vin,
-                        "EBROCHURE_URL": ebrochure_url,
-                        "CARFAX_URL": carfax_url,
-                        "STATUS": status_label,
-                        "ERROR_MESSAGE": error,
-                        "FILE_NAME": file_info,
-                    }
-                )
+                    if download_files:
+                        try:
+                            r2 = session.get(carfax_url, timeout=30)
 
-                # Be a tiny bit polite to the servers
-                time.sleep(0.3)
+                            content_type = r2.headers.get("Content-Type", "").lower()
+                            ext = ".pdf" if "pdf" in content_type else ".html"
+
+                            file_name = f"{vin}{ext}"
+                            carfax_files[file_name] = r2.content
+                            status_label = "DOWNLOADED"
+
+                        except Exception as e:
+                            status_label = f"URL_ONLY ({e})"
 
             except Exception as e:
-                error = str(e)
-                results.append(
-                    {
-                        "VIN": vin,
-                        "EBROCHURE_URL": ebrochure_url,
-                        "CARFAX_URL": None,
-                        "STATUS": "ERROR",
-                        "ERROR_MESSAGE": error,
-                    }
-                )
+                status_label = f"API_ERROR: {e}"
 
-        progress.progress(1.0)
-        status_text.text("Done!")
+            results.append({
+                "VIN": vin,
+                "EBROCHURE_URL": e_url,
+                "VID": vid,
+                "CARFAX_URL": carfax_url,
+                "STATUS": status_label,
+                "FILE_NAME": file_name
+            })
+
+            time.sleep(0.1)
 
         results_df = pd.DataFrame(results)
 
-        st.subheader("Scrape results")
+        st.subheader("Results")
         st.dataframe(results_df)
 
-        # Merge CARFAX_URL back into original df (by VIN)
+        # Attach CARFAX_URL to original CSV
         merged = df.copy()
-        # Build lookup by VIN
-        carfax_lookup = (
-            results_df[["VIN", "CARFAX_URL"]]
-            .dropna(subset=["VIN"])
-            .drop_duplicates(subset=["VIN"])
-            .set_index("VIN")["CARFAX_URL"]
-            .to_dict()
-        )
+        lut = results_df.set_index("VIN")["CARFAX_URL"].to_dict()
+        merged["CARFAX_URL"] = merged[vin_col].astype(str).map(lut)
 
-        merged["CARFAX_URL"] = merged[vin_col].astype(str).map(carfax_lookup)
-
-        # Download enriched CSV
-        csv_buffer = io.StringIO()
-        merged.to_csv(csv_buffer, index=False)
-        csv_bytes = csv_buffer.getvalue().encode("utf-8")
+        csv_buf = io.StringIO()
+        merged.to_csv(csv_buf, index=False)
 
         st.download_button(
-            label="⬇️ Download CSV with CARFAX_URL column",
-            data=csv_bytes,
-            file_name="listings_with_carfax.csv",
-            mime="text/csv",
+            "⬇️ Download CSV with CARFAX_URL",
+            csv_buf.getvalue().encode(),
+            "listings_with_carfax.csv",
+            "text/csv"
         )
 
-        # ZIP of Carfax files, if we downloaded them
-        if download_carfax_files and carfax_files:
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for vin, (filename, content) in carfax_files.items():
-                    zf.writestr(filename, content)
-            zip_buffer.seek(0)
+        # ZIP of Carfax files
+        if download_files and carfax_files:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w") as zipf:
+                for fname, content in carfax_files.items():
+                    zipf.writestr(fname, content)
 
+            zip_buf.seek(0)
             st.download_button(
-                label=f"⬇️ Download ZIP of {len(carfax_files)} Carfax files",
-                data=zip_buffer,
-                file_name="carfax_reports.zip",
-                mime="application/zip",
+                f"⬇️ Download ZIP of {len(carfax_files)} Carfax files",
+                zip_buf,
+                "carfax_reports.zip",
+                "application/zip"
             )
-        elif download_carfax_files:
-            st.warning("No Carfax files were downloaded; check the results table above.")
