@@ -96,6 +96,26 @@ if uploaded is not None:
             r"=HYPERLINK\(\"([^\"]+)\"(?:,\"[^\"]*\")?\)", re.IGNORECASE
         )
 
+        def fetch_ebrochure(url: str, retries: int = 3, backoff: float = 1.5):
+            """Fetch an AutoNation eBrochure page with a few retries."""
+
+            last_exc = None
+            for attempt in range(1, retries + 1):
+                try:
+                    resp = session.get(url, timeout=30, allow_redirects=True)
+                    resp.raise_for_status()
+                    return resp
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == retries:
+                        break
+                    # Gentle backoff between attempts
+                    time.sleep(backoff * attempt)
+
+            raise RuntimeError(
+                f"Failed to fetch eBrochure after {retries} attempts: {last_exc}"
+            )
+
         def normalize_url(raw_value: str) -> str:
             """Handle Excel-style HYPERLINK formulas and bare domains."""
 
