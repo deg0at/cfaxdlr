@@ -93,12 +93,31 @@ if uploaded is not None:
         def warm_up_session(sess: requests.Session) -> None:
             """Prime the session with AutoNation cookies to avoid 403 responses."""
 
-            try:
-                warmup_resp = sess.get("https://www.autonation.com/", timeout=30)
-                warmup_resp.raise_for_status()
-            except Exception as exc:
+            warmup_urls = [
+                "https://www.autonation.com/",
+                # robots.txt is public and usually works even when the
+                # marketing site responds with 403 for programmatic clients.
+                "https://www.autonation.com/robots.txt",
+            ]
+
+            last_error = None
+            for url in warmup_urls:
+                try:
+                    resp = sess.get(url, timeout=30)
+                    # Some Akamai frontends reply with 403 but still set the
+                    # Optanon/Akamai cookies that we need. If cookies were set,
+                    # consider the warm-up successful.
+                    if resp.ok or (resp.status_code == 403 and sess.cookies):
+                        return
+                    last_error = RuntimeError(
+                        f"Warm-up URL {url} returned status {resp.status_code}"
+                    )
+                except Exception as exc:
+                    last_error = exc
+
+            if last_error:
                 # Don't fail the whole run—if the warm-up fails we can still try.
-                st.warning(f"Unable to warm up AutoNation session: {exc}")
+                st.warning(f"Unable to warm up AutoNation session: {last_error}")
 
         # AutoNation's EBROCHURE endpoint tends to return 403 unless we visit the
         # main site first and capture the cookies it sets (Akamai/Optanon, etc.).
