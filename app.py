@@ -92,18 +92,6 @@ if uploaded is not None:
 
         total = len(df)
 
-        def fetch_ebrochure(url: str) -> requests.Response:
-            """Fetch AutoNation eBrochure, retrying with stricter headers on 403."""
-
-            resp = session.get(url, timeout=20)
-            if resp.status_code == 403:
-                # Retry with a per-request Referer matching the URL in case the
-                # initial site-wide referer header is rejected.
-                retry_headers = {**DEFAULT_HEADERS, "Referer": url}
-                resp = session.get(url, timeout=20, headers=retry_headers)
-            resp.raise_for_status()
-            return resp
-
         hyperlink_pattern = re.compile(
             r"=HYPERLINK\(\"([^\"]+)\"(?:,\"[^\"]*\")?\)", re.IGNORECASE
         )
