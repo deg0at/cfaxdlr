@@ -90,6 +90,20 @@ if uploaded is not None:
         session = requests.Session()
         session.headers.update(DEFAULT_HEADERS)
 
+        def warm_up_session(sess: requests.Session) -> None:
+            """Prime the session with AutoNation cookies to avoid 403 responses."""
+
+            try:
+                warmup_resp = sess.get("https://www.autonation.com/", timeout=30)
+                warmup_resp.raise_for_status()
+            except Exception as exc:
+                # Don't fail the whole run—if the warm-up fails we can still try.
+                st.warning(f"Unable to warm up AutoNation session: {exc}")
+
+        # AutoNation's EBROCHURE endpoint tends to return 403 unless we visit the
+        # main site first and capture the cookies it sets (Akamai/Optanon, etc.).
+        warm_up_session(session)
+
         total = len(df)
 
         hyperlink_pattern = re.compile(
