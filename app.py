@@ -15,6 +15,14 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    # AutoNation's eBrochure endpoint expects a same-site referer.
+    "Referer": "https://www.autonation.com/",
+}
+
 st.set_page_config(page_title="AutoNation Carfax Fetcher", layout="wide")
 st.title("🚗 AutoNation eBrochure → Carfax Fetcher")
 
@@ -80,7 +88,7 @@ if uploaded is not None:
         status_text = st.empty()
 
         session = requests.Session()
-        session.headers.update({"User-Agent": USER_AGENT})
+        session.headers.update(DEFAULT_HEADERS)
 
         total = len(df)
 
@@ -139,8 +147,7 @@ if uploaded is not None:
 
             try:
                 # 1) Fetch eBrochure HTML
-                resp = session.get(ebrochure_url, timeout=20)
-                resp.raise_for_status()
+                resp = fetch_ebrochure(ebrochure_url)
 
                 soup = BeautifulSoup(resp.text, "html.parser")
 
