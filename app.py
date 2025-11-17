@@ -1,6 +1,8 @@
 import io
+import re
 import time
 import zipfile
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -12,6 +14,14 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    # AutoNation's eBrochure endpoint expects a same-site referer.
+    "Referer": "https://www.autonation.com/",
+}
 
 st.set_page_config(page_title="AutoNation Carfax Fetcher", layout="wide")
 st.title("🚗 AutoNation eBrochure → Carfax Fetcher")
@@ -78,14 +88,54 @@ if uploaded is not None:
         status_text = st.empty()
 
         session = requests.Session()
-        session.headers.update({"User-Agent": USER_AGENT})
+        session.headers.update(DEFAULT_HEADERS)
 
         total = len(df)
+
+        def fetch_ebrochure(url: str) -> requests.Response:
+            """Fetch AutoNation eBrochure, retrying with stricter headers on 403."""
+
+            resp = session.get(url, timeout=20)
+            if resp.status_code == 403:
+                # Retry with a per-request Referer matching the URL in case the
+                # initial site-wide referer header is rejected.
+                retry_headers = {**DEFAULT_HEADERS, "Referer": url}
+                resp = session.get(url, timeout=20, headers=retry_headers)
+            resp.raise_for_status()
+            return resp
+
+        hyperlink_pattern = re.compile(
+            r"=HYPERLINK\(\"([^\"]+)\"(?:,\"[^\"]*\")?\)", re.IGNORECASE
+        )
+
+        def normalize_url(raw_value: str) -> str:
+            """Handle Excel-style HYPERLINK formulas and bare domains."""
+
+            if not isinstance(raw_value, str):
+                raw_value = "" if pd.isna(raw_value) else str(raw_value)
+
+            cleaned = raw_value.strip().strip("'\"")
+
+            match = hyperlink_pattern.fullmatch(cleaned)
+            if match:
+                cleaned = match.group(1).strip()
+
+            if cleaned.startswith("www."):
+                cleaned = f"https://{cleaned}"
+
+            return cleaned
+
+        def is_valid_url(url: str) -> bool:
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                return False
+            return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
         for idx, row in df.iterrows():
             progress.progress((idx + 1) / total)
             vin = str(row[vin_col]) if not pd.isna(row[vin_col]) else f"row_{idx}"
-            ebrochure_url = str(row[ebrochure_col]).strip()
+            ebrochure_url = normalize_url(row[ebrochure_col])
 
             status_text.text(f"[{idx+1}/{total}] Processing VIN {vin}…")
 
@@ -94,7 +144,7 @@ if uploaded is not None:
             file_info = None
 
             # Basic sanity check
-            if not ebrochure_url.startswith("http"):
+            if not is_valid_url(ebrochure_url):
                 error = "Invalid eBrochure URL"
                 results.append(
                     {
@@ -109,8 +159,7 @@ if uploaded is not None:
 
             try:
                 # 1) Fetch eBrochure HTML
-                resp = session.get(ebrochure_url, timeout=20)
-                resp.raise_for_status()
+                resp = fetch_ebrochure(ebrochure_url)
 
                 soup = BeautifulSoup(resp.text, "html.parser")
 
